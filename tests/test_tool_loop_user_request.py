@@ -66,6 +66,19 @@ class TestToolLoopKeepsUserRequest(unittest.TestCase):
         tail = prompt[prompt.index("### LATEST TOOL RESULTS RECEIVED."):]
         self.assertIn(QUESTION, tail)
 
+    def test_full_tool_prompt_anchors_pending_request_above_transcript(self):
+        prompt = _format_messages_as_prompt(_history_with_tool_loop())
+        head = prompt[: prompt.index("Conversation transcript:")]
+        self.assertIn("### ACTIVE OBJECTIVE:", head)
+        self.assertIn(QUESTION, head)
+        self.assertNotIn("Hide the menu and deploy.", head)
+
+    def test_full_user_prompt_keeps_single_objective(self):
+        history = _history_with_tool_loop()[:4]
+        prompt = _format_messages_as_prompt(history)
+        self.assertEqual(prompt.count("### ACTIVE OBJECTIVE:"), 1)
+        self.assertIn("The user has submitted a new request", prompt)
+
     def test_user_turn_prompt_is_unchanged(self):
         history = _history_with_tool_loop()[:4]
         prompt = _format_delta_prompt(history[-1:], pending_user_text=QUESTION)

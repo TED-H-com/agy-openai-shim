@@ -96,6 +96,24 @@ def _pending_user_request_section(user_text: str) -> str:
     )
 
 
+def _tool_loop_objective_section(user_text: str) -> str:
+    """Anchor the request a tool loop serves above the transcript.
+
+    A full prompt that ends on a tool result (first call after a worker
+    respawn or a broken pipe) otherwise names the request only at the tail,
+    and a long transcript drowns a tail-only instruction.
+    """
+    return (
+        "### ACTIVE OBJECTIVE:\n"
+        f"The user request being served is:\n\"{user_text}\"\n\n"
+        "CRITICAL: The conversation transcript below contains prior history and the tool calls made so far. "
+        "Use the tool results ONLY to address the ACTIVE OBJECTIVE above. "
+        "When tool execution is complete, your final answer must directly address this objective. "
+        "Do NOT repeat earlier completion reports, summaries, or boilerplate from previous tasks, "
+        "and do NOT resume an earlier task."
+    )
+
+
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -209,6 +227,10 @@ def _format_messages_as_prompt(
             "Do NOT silently continue prior tool execution loops or earlier coding tasks unless explicitly requested by the ACTIVE OBJECTIVE. "
             "Focus your attention on answering the new request."
         )
+    elif last_role == "tool":
+        pending_objective = _latest_user_text(history_messages)
+        if pending_objective:
+            sections.append(_tool_loop_objective_section(pending_objective))
 
     if transcript:
         sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
