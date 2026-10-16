@@ -72,6 +72,48 @@ def _latest_user_request_section(user_text: str) -> str:
     )
 
 
+def _latest_user_text(messages: Sequence[Any]) -> str:
+    """Return the rendered text of the last user message, or an empty string."""
+    for msg in reversed(list(messages or [])):
+        if isinstance(msg, dict) and str(msg.get("role") or "").strip().lower() == "user":
+            return _render_message_content(msg.get("content"))
+    return ""
+
+
+def _pending_user_request_section(user_text: str) -> str:
+    """Restate the user request that the current tool loop is serving.
+
+    Tool-result turns otherwise end with a generic "continue" line, so after a
+    few tool calls the request falls far behind the newest text the model sees
+    and the model drifts back to the dominant pattern in the transcript (for
+    example re-sending an earlier completion report).
+    """
+    return (
+        f"### USER REQUEST THIS TOOL LOOP IS SERVING:\nUser:\n{user_text}\n\n"
+        "INSTRUCTION: Use the tool results only to answer THIS request. "
+        "When you have enough information, answer it directly and specifically. "
+        "Do NOT repeat earlier reports or summaries from the transcript unless this request asks for them."
+    )
+
+
+def _tool_loop_objective_section(user_text: str) -> str:
+    """Anchor the request a tool loop serves above the transcript.
+
+    A full prompt that ends on a tool result (first call after a worker
+    respawn or a broken pipe) otherwise names the request only at the tail,
+    and a long transcript drowns a tail-only instruction.
+    """
+    return (
+        "### ACTIVE OBJECTIVE:\n"
+        f"The user request being served is:\n\"{user_text}\"\n\n"
+        "CRITICAL: The conversation transcript below contains prior history and the tool calls made so far. "
+        "Use the tool results ONLY to address the ACTIVE OBJECTIVE above. "
+        "When tool execution is complete, your final answer must directly address this objective. "
+        "Do NOT repeat earlier completion reports, summaries, or boilerplate from previous tasks, "
+        "and do NOT resume an earlier task."
+    )
+
+
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -185,6 +227,10 @@ def _format_messages_as_prompt(
             "Do NOT silently continue prior tool execution loops or earlier coding tasks unless explicitly requested by the ACTIVE OBJECTIVE. "
             "Focus your attention on answering the new request."
         )
+    elif last_role == "tool":
+        pending_objective = _latest_user_text(history_messages)
+        if pending_objective:
+            sections.append(_tool_loop_objective_section(pending_objective))
 
     if transcript:
         sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
@@ -196,6 +242,9 @@ def _format_messages_as_prompt(
             "If more tools are needed, emit <tool_call> tags. If you have enough information, "
             "respond clearly to the user without repeating prior summaries."
         )
+        pending = _latest_user_text(history_messages)
+        if pending:
+            sections.append(_pending_user_request_section(pending))
     elif last_role == "user" and last_msg is not None:
         user_text = _render_message_content(last_msg.get("content"))
         sections.append(_latest_user_request_section(user_text))
@@ -221,8 +270,16 @@ def _messages_match_prefix(history: Sequence[dict[str, Any]], incoming: Sequence
     return True
 
 
-def _format_delta_prompt(new_messages: Sequence[dict[str, Any]]) -> str:
-    """Format only the incremental messages in an ongoing multi-turn interaction."""
+def _format_delta_prompt(
+    new_messages: Sequence[dict[str, Any]],
+    pending_user_text: str = "",
+) -> str:
+    """Format only the incremental messages in an ongoing multi-turn interaction.
+
+    ``pending_user_text`` is the latest user request from the full history.
+    A tool-result delta does not contain it, so the caller passes it in and it
+    is restated after the continue instruction.
+    """
     valid_messages = [m for m in new_messages if isinstance(m, dict)]
     if not valid_messages:
         return ""
@@ -282,6 +339,8 @@ def _format_delta_prompt(new_messages: Sequence[dict[str, Any]]) -> str:
             "If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in your text output. "
             "Do NOT invoke native tools directly."
         )
+        if pending_user_text:
+            parts.append(_pending_user_request_section(pending_user_text))
     elif last_role == "user":
         user_text = _render_message_content(last_msg.get("content"))
         parts.append(_latest_user_request_section(user_text))
