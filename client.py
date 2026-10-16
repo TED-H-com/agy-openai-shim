@@ -58,6 +58,7 @@ try:
         _parse_tool_block,
         _render_message_content,
     )
+    from .delivery import DeliveryWatch
     from .stream import AntigravityStream, collect_stream_completion
     from .debug import dump_prompt_debug
 except ImportError:
@@ -90,6 +91,7 @@ except ImportError:
         _parse_tool_block,
         _render_message_content,
     )
+    from delivery import DeliveryWatch
     from stream import AntigravityStream, collect_stream_completion
     from debug import dump_prompt_debug
 
@@ -294,6 +296,10 @@ class AntigravityClient:
 
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
         self.is_closed = False
+        # Last turn's (assembled prompt size, delivered input tokens), so a
+        # prompt that grows while its delivered token count does not can be
+        # reported: see delivery.py and issue #29.
+        self._delivery_watch = DeliveryWatch()
         self._active_processes: set[subprocess.Popen] = set()
         # RLock (NOT a plain Lock) deliberately -- issue #10.
         #
@@ -642,6 +648,7 @@ class AntigravityClient:
             timeout=timeout,
             tools=tools,
             is_worker=False,
+            prompt_chars=len(prompt_text),
         )
         if stream:
             return stream_iter
@@ -754,6 +761,7 @@ class AntigravityClient:
                     worker_lock_held=worker_acquired,
                     messages=messages_list,
                     usage_baseline=worker_usage_baseline,
+                    prompt_chars=len(prompt_payload),
                 )
                 if stream:
                     return stream_iter

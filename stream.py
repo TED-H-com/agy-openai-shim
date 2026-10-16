@@ -146,6 +146,7 @@ class AntigravityStream(Iterator[Any]):
         worker_lock_held: bool | None = None,
         messages: list[dict[str, Any]] | None = None,
         usage_baseline: dict[str, int] | None = None,
+        prompt_chars: int = 0,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -183,6 +184,9 @@ class AntigravityStream(Iterator[Any]):
         # Cumulative usage snapshot of the worker session that owns this
         # stream; only worker streams receive one (see client._create_chat_completion).
         self.usage_baseline = usage_baseline
+        # Size of the prompt this stream's process was fed, so the usage chunk
+        # can be checked against it (delivery.py, issue #29).
+        self.prompt_chars = max(int(prompt_chars or 0), 0)
         self.conversation_id = ""
         self._closed = False
         self._interrupted = False
@@ -913,6 +917,13 @@ class AntigravityStream(Iterator[Any]):
             # absorbs them. There is no yield between this computation and
             # the finish-reason yield, so chunk emission order is unchanged.
             input_tokens, output_tokens, total_tokens, cached_tokens = self._usage_totals(usage_data)
+
+            # Delivery check (issue #29): report a turn whose prompt reached
+            # the worker short of what we assembled. Detection only -- the
+            # turn, the chunks and the usage reported to Hermes are unchanged.
+            watch = getattr(self.client, "_delivery_watch", None)
+            if watch is not None and self.prompt_chars:
+                watch.observe(self.prompt_chars, input_tokens)
 
             yield self._make_chunk(finish_reason=finish_reason)
 
