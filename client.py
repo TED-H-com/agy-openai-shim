@@ -296,9 +296,8 @@ class AntigravityClient:
 
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
         self.is_closed = False
-        # Last turn's (assembled prompt size, delivered input tokens), so a
-        # prompt that grows while its delivered token count does not can be
-        # reported: see delivery.py and issue #29.
+        # Valid fresh-context full-send samples only. Worker deltas and
+        # concurrent oneshots are not comparable: see delivery.py and issue #29.
         self._delivery_watch = DeliveryWatch()
         self._active_processes: set[subprocess.Popen] = set()
         # RLock (NOT a plain Lock) deliberately -- issue #10.
@@ -481,6 +480,8 @@ class AntigravityClient:
         # The session is gone: any later usage from it belongs to a dead
         # session, and the next spawn must start from a clean baseline.
         self._worker_usage_baseline = {}
+        # Full-send diagnostics compare only fresh-context requests, never
+        # session counters or deltas. Their reference survives worker resets.
         if not keep_conversation:
             self._worker_conversation_id = None
             self._conversation_history = []
@@ -649,6 +650,9 @@ class AntigravityClient:
             tools=tools,
             is_worker=False,
             prompt_chars=len(prompt_text),
+            # Oneshots run concurrently when the worker is busy. They have no
+            # comparable prior sample and must not mutate the worker watch.
+            delivery_watch=None,
         )
         if stream:
             return stream_iter
@@ -696,6 +700,7 @@ class AntigravityClient:
                     is_continuation = _messages_match_prefix(ref_history, messages_list)
                     conv_id_to_resume = self._worker_conversation_id if is_continuation else None
 
+                comparable_full_send = not is_continuation
                 if is_continuation:
                     proc = self._get_or_spawn_worker(
                         resolved_model, effort, conversation_id=conv_id_to_resume
@@ -731,6 +736,7 @@ class AntigravityClient:
                     proc.stdin.write(json.dumps(event_msg) + "\n")
                     proc.stdin.flush()
                 except (BrokenPipeError, OSError):
+                    comparable_full_send = True
                     with self._lock:
                         self._terminate_worker_locked(keep_conversation=False)
                         self._purge_isolated_conversations()
@@ -762,6 +768,8 @@ class AntigravityClient:
                     messages=messages_list,
                     usage_baseline=worker_usage_baseline,
                     prompt_chars=len(prompt_payload),
+                    delivery_watch=self._delivery_watch if comparable_full_send else None,
+                    delivery_sample_key=f"{resolved_model}:{effort}",
                 )
                 if stream:
                     return stream_iter

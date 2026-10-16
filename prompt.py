@@ -72,11 +72,26 @@ def _latest_user_request_section(user_text: str) -> str:
     )
 
 
+# Core strips private message keys before providers see the request. Match only
+# the complete known recovery text, never arbitrary user text containing it.
+_EMPTY_TOOL_RESPONSE_NUDGE = (
+    "You just executed tool calls but returned an empty response. "
+    "Please process the tool results above and continue with the task."
+)
+
+
+def _is_recovery_nudge(message: dict[str, Any]) -> bool:
+    return bool(message.get("_empty_recovery_synthetic")) or (
+        _render_message_content(message.get("content")) == _EMPTY_TOOL_RESPONSE_NUDGE
+    )
+
+
 def _latest_user_text(messages: Sequence[Any]) -> str:
     """Return the rendered text of the last user message, or an empty string."""
     for msg in reversed(list(messages or [])):
         if isinstance(msg, dict) and str(msg.get("role") or "").strip().lower() == "user":
-            return _render_message_content(msg.get("content"))
+            if not _is_recovery_nudge(msg):
+                return _render_message_content(msg.get("content"))
     return ""
 
 
@@ -158,7 +173,8 @@ def _format_messages_as_prompt(
     _TOOL_MAX_CHARS_CAP = 20000
 
     transcript: list[str] = []
-    prior_messages = history_messages[:-1] if last_role == "user" and len(history_messages) > 1 else history_messages
+    recovery_turn = last_role == "user" and last_msg is not None and _is_recovery_nudge(last_msg)
+    prior_messages = history_messages[:-1] if last_role == "user" and not recovery_turn and len(history_messages) > 1 else history_messages
 
     tool_indices = [
         i for i, msg in enumerate(prior_messages)
@@ -218,7 +234,11 @@ def _format_messages_as_prompt(
         if rendered_content:
             transcript.append(f"{label}:\n{rendered_content}")
 
-    if last_role == "user" and last_msg is not None and len(history_messages) > 1:
+    if recovery_turn:
+        objective = _latest_user_text(history_messages)
+        if objective:
+            sections.append(_tool_loop_objective_section(objective))
+    elif last_role == "user" and last_msg is not None and len(history_messages) > 1:
         user_text = _render_message_content(last_msg.get("content"))
         sections.append(
             "### ACTIVE OBJECTIVE:\n"
@@ -246,8 +266,9 @@ def _format_messages_as_prompt(
         if pending:
             sections.append(_pending_user_request_section(pending))
     elif last_role == "user" and last_msg is not None:
-        user_text = _render_message_content(last_msg.get("content"))
-        sections.append(_latest_user_request_section(user_text))
+        user_text = _latest_user_text(history_messages)
+        if user_text:
+            sections.append(_latest_user_request_section(user_text))
     else:
         sections.append("Continue the conversation from the latest message.")
     return "\n\n".join(s.strip() for s in sections if s and s.strip())
@@ -287,7 +308,8 @@ def _format_delta_prompt(
     last_msg = valid_messages[-1]
     last_role = str(last_msg.get("role") or "").strip().lower()
 
-    if last_role == "user":
+    recovery_turn = last_role == "user" and _is_recovery_nudge(last_msg)
+    if last_role == "user" and not recovery_turn:
         prior_messages = valid_messages[:-1]
     else:
         prior_messages = valid_messages
@@ -342,8 +364,9 @@ def _format_delta_prompt(
         if pending_user_text:
             parts.append(_pending_user_request_section(pending_user_text))
     elif last_role == "user":
-        user_text = _render_message_content(last_msg.get("content"))
-        parts.append(_latest_user_request_section(user_text))
+        user_text = (pending_user_text or _latest_user_text(valid_messages)) if recovery_turn else _render_message_content(last_msg.get("content"))
+        if user_text:
+            parts.append(_latest_user_request_section(user_text))
     else:
         parts.append("Continue the conversation from the latest message above.")
     return "\n\n".join(s.strip() for s in parts if s and s.strip())

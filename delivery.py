@@ -1,36 +1,27 @@
-"""Short-delivery detection for prompts the worker receives truncated.
+"""Heuristic warning for materially larger full sends with flat input usage.
 
-The Antigravity worker shortens long prompts from the tail, silently and
-variably (soyelmismo/hermes-antigravity-subscription#29, measured 2026-10-12:
-a 252,156-character prompt was delivered as 96,658 input tokens on one turn
-and 114,794 on the next, with the tail -- usually the instruction -- lost
-first). Nothing in the request path notices: the model answers the shortened
-prompt, the usage chunk reports healthy token counts, and the turn looks
-ordinary.
+Only fresh-context full sends on the same model/effort route are comparable.
+Worker deltas measure increment characters against whole-context usage and are
+excluded. Concurrent oneshots do not contribute samples. Cached input is included
+conservatively, without changing usage reported to Hermes.
 
-This module detects the signature that survives every material-dependent
-guesswork: the *assembled* prompt keeps growing while the *delivered* input
-tokens stop growing. No tokenizer and no chars-per-token constant are needed,
-which matters because the ratio on this route varies about tenfold with the
-material (dense numeric tables tokenise far heavier than prose).
-
-It is a detector, not a guard: it reports the first over-the-line turn in a
-session, so a caller can warn, retry with a chunked prompt, or fall back to a
-provider that delivers whole prompts. Predicting the cut before sending is a
-separate problem (see the same issue's preflight note).
+This is not proof of delivery: changed material density can cause false positives.
+The first send, stable-size truncation, and ordinary tool loops are blind spots.
+It does not prevent or repair soyelmismo/hermes-antigravity-subscription#29.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["DeliverySample", "DeliveryWatch", "ShortDelivery", "DISABLE_ENV"]
 
-# Below this, prompts are trivially deliverable and the ratio maths is noise.
+# Ignore small prompts where relative growth is noisy. This is not a safety limit.
 MIN_PROMPT_CHARS = 20_000
 # A jump smaller than this is ordinary turn-to-turn churn, not a rewrite.
 MIN_CHARS_GROWTH = 8_000
@@ -84,30 +75,38 @@ class ShortDelivery:
 
 
 class DeliveryWatch:
-    """Per-client record of the last turn's (prompt size, delivered tokens).
+    """Thread-safe record of valid, comparable full-send samples.
 
-    The comparison is deliberately between *consecutive turns*, not against a
-    predicted size: within one session the material usually stays similar, so
-    a flat token count under a growing prompt is decisive, whereas an absolute
-    chars-per-token constant would either miss dense payloads or cry wolf on
-    prose. One warning per session is enough -- the condition persists once it
-    starts -- so the latch suppresses repeats until the prompt shrinks back.
+    A smaller send or route change clears the warning latch. Missing usage
+    leaves the previous valid sample intact.
     """
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._last: DeliverySample | None = None
+        self._sample_key = ""
         self._latched = False
 
     @property
     def last_sample(self) -> DeliverySample | None:
-        return self._last
+        with self._lock:
+            return self._last
 
-    def observe(self, prompt_chars: int, input_tokens: int) -> ShortDelivery | None:
-        """Feed one completed turn; return the finding when delivery fell short."""
-        if os.environ.get(DISABLE_ENV):
+    def observe(
+        self, prompt_chars: int, input_tokens: int, *, sample_key: str = ""
+    ) -> ShortDelivery | None:
+        """Compare valid full sends on the same route. This is only a heuristic."""
+        if os.environ.get(DISABLE_ENV) or prompt_chars <= 0 or input_tokens <= 0:
             return None
+        with self._lock:
+            return self._observe_locked(prompt_chars, input_tokens, sample_key)
 
-        current = DeliverySample(prompt_chars=max(int(prompt_chars), 0), input_tokens=int(input_tokens))
+    def _observe_locked(self, prompt_chars: int, input_tokens: int, sample_key: str) -> ShortDelivery | None:
+        current = DeliverySample(prompt_chars=int(prompt_chars), input_tokens=int(input_tokens))
+        if sample_key != self._sample_key:
+            self._last = None
+            self._latched = False
+            self._sample_key = sample_key
         previous, self._last = self._last, current
 
         # A shrunken prompt is a new conversation, a cleared context, or a
