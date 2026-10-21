@@ -1,0 +1,16 @@
+[Unit]
+Description=agy-openai-shim: OpenAI-compatible loopback endpoint over Google agy CLI (3-account account pool) for OpenClaw
+Documentation=file:%h/.local/share/agy-openai-shim/README.md
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/agy-openai-shim/env
+ExecStart=/usr/bin/python3 %h/.local/share/agy-openai-shim/server.py
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

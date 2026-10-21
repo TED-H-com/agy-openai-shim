@@ -1,0 +1,624 @@
+"""Antigravity Subscription DirectSDK client for Hermes Agent.
+
+Drives the official Antigravity CLI (`agy`) as an external process in
+stream-json mode to provide request-scoped completions using the user's
+existing Antigravity / Gemini subscription quota.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import contextlib
+import json
+import logging
+import subprocess
+import tempfile
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+try:
+    from .models import (
+        _FALLBACK_MODELS,
+        _MODEL_ALIASES,
+        _normalize_effort,
+        resolve_model_and_effort,
+    )
+    from .process import (
+        AGY_MARKER_BASE_URL,
+        _kill_process_tree,
+        _own_process_group,
+        build_child_env,
+        is_authenticated,
+        resolve_agy_command,
+        resolve_real_token_path,
+        setup_isolated_home,
+        terminate_process,
+    )
+    from .prompt import (
+        _PROMPT_PREAMBLE,
+        _ROLE_LABELS,
+        _format_delta_prompt,
+        _format_messages_as_prompt,
+        _longest_tool_call_prefix_match,
+        _messages_match_prefix,
+        _parse_tool_block,
+        _render_message_content,
+    )
+    from .stream import AntigravityStream, collect_stream_completion
+    from . import accounts as agy_pool
+except ImportError:
+    from models import (
+        _FALLBACK_MODELS,
+        _MODEL_ALIASES,
+        _normalize_effort,
+        resolve_model_and_effort,
+    )
+    from process import (
+        AGY_MARKER_BASE_URL,
+        _kill_process_tree,
+        _own_process_group,
+        build_child_env,
+        is_authenticated,
+        resolve_agy_command,
+        resolve_real_token_path,
+        setup_isolated_home,
+        terminate_process,
+    )
+    from prompt import (
+        _PROMPT_PREAMBLE,
+        _ROLE_LABELS,
+        _format_delta_prompt,
+        _format_messages_as_prompt,
+        _longest_tool_call_prefix_match,
+        _messages_match_prefix,
+        _parse_tool_block,
+        _render_message_content,
+    )
+    from stream import AntigravityStream, collect_stream_completion
+    import accounts as agy_pool
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_TIMEOUT_SECONDS = 300.0
+
+__all__ = [
+    "AGY_MARKER_BASE_URL",
+    "AntigravityClient",
+    "AntigravityStream",
+    "_FALLBACK_MODELS",
+    "_MODEL_ALIASES",
+    "_PROMPT_PREAMBLE",
+    "_ROLE_LABELS",
+    "_format_delta_prompt",
+    "_format_messages_as_prompt",
+    "_kill_process_tree",
+    "_longest_tool_call_prefix_match",
+    "_messages_match_prefix",
+    "_normalize_effort",
+    "_own_process_group",
+    "_parse_tool_block",
+    "_render_message_content",
+    "is_authenticated",
+    "resolve_agy_command",
+    "resolve_model_and_effort",
+]
+
+
+class _StderrTail:
+    """Continuously drain stderr, retaining at most 64 KiB of text."""
+    def __init__(self, proc: subprocess.Popen):
+        self._chunks = deque()
+        self._size = 0
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._drain, args=(proc,), daemon=True,
+                                        name="agy-stderr")
+        self._thread.start()
+
+    def _drain(self, proc: subprocess.Popen) -> None:
+        try:
+            while proc.stderr:
+                chunk = proc.stderr.read(4096)
+                if not chunk:
+                    break
+                with self._lock:
+                    self._chunks.append(chunk)
+                    self._size += len(chunk)
+                    while self._size > 65536:
+                        self._size -= len(self._chunks.popleft())
+        except (OSError, ValueError):
+            pass
+
+    def text(self) -> str:
+        self._thread.join(timeout=0.5)
+        with self._lock:
+            return "".join(self._chunks)
+
+
+class AntigravityClient:
+    """OpenAI-compatible client facade driving Antigravity CLI.
+
+    Async compatibility boundary (issue #8)
+    --------------------------------------
+    Hermes drives this client from its async auxiliary path: with
+    ``HERMES_SKIP_ASYNC_WRAP`` the client is used as-is ("already async-safe"),
+    and the caller then does ``await client.chat.completions.create(...)``.
+    Everything the facade returns is therefore awaitable-yielding-itself —
+    ``stream._AwaitableCompletion`` for the non-streaming plan (which simply
+    wraps the already-assembled response) and ``stream.AntigravityStream`` for
+    the streaming plan (awaitable plus ``async for`` via ``__anext__``). Sync
+    callers are untouched: the objects keep the same attributes and the same
+    blocking behavior, so no existing caller needs to change.
+
+    Known limitation (documented on purpose, not fixed here): the non-streaming
+    ``create()`` executes the whole subprocess round-trip synchronously before
+    it returns, so awaiting it still blocks the event loop for the request's
+    duration. This is identical to the pre-existing sync behavior and to
+    Hermes' own CopilotACPClient shim, and there is no plugin-side fix without
+    a Hermes hook that would let ``create()`` hand back a coroutine instead of
+    a finished value.
+    """
+
+    # Instruct Hermes not to wrap this client in wire transports or async adapters
+    HERMES_SKIP_TRANSPORT_WRAP = True
+    HERMES_SKIP_ASYNC_WRAP = True
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        command: str | None = None,
+        args: list[str] | None = None,
+        cwd: str | None = None,
+        **_: Any,
+    ):
+        self.api_key = api_key or "antigravity-directsdk"
+        self.base_url = base_url or AGY_MARKER_BASE_URL
+        self._command = command or resolve_agy_command()
+        self._args = list(args or ["--output-format", "stream-json", "--disable-slash-commands"])
+        self._temp_dir = None
+        if cwd:
+            self._cwd = cwd
+        else:
+            self._temp_dir = tempfile.TemporaryDirectory(prefix="hermes_agy_")
+            self._cwd = self._temp_dir.name
+
+        # Isolate agy state and session index from the user's real ~/.gemini/antigravity-cli
+        self._isolated_home, self._isolated_gemini_dir = setup_isolated_home(self._cwd)
+
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
+        self.is_closed = False
+        self._active_processes: set[subprocess.Popen] = set()
+        self._lock = threading.Lock()
+        self._worker_proc: subprocess.Popen | None = None
+        self._worker_model: str | None = None
+        self._worker_effort: str | None = None
+        self._worker_history: list[dict[str, Any]] = []
+        # Cumulative usage snapshot of the current worker session. agy 1.2.10+
+        # persistent workers report cumulative session usage, so per-turn
+        # deltas need this baseline. The reference is replaced on every spawn
+        # and termination; the dict contents are advanced in place by the
+        # owning session's stream. Each stream captures the dict of the
+        # session it was created for, so a stream left over from a terminated
+        # session cannot corrupt a later session's baseline.
+        self._worker_usage_baseline: dict[str, int] = {}
+        self._worker_lock = threading.Lock()
+        # Multi-account pool (local patch): account the worker was spawned for.
+        self._worker_account: str | None = None
+        self._pool_homes: dict[str, tuple[Path, tuple[Path, Path]]] = {}
+
+    @staticmethod
+    def _resolve_real_token_path() -> Path | None:
+        return resolve_real_token_path()
+
+    def _resolve_model_and_effort(
+        self,
+        model: str | None,
+        reasoning_effort: str | None = None,
+    ) -> tuple[str, str | None]:
+        return resolve_model_and_effort(model, reasoning_effort)
+
+    def _account_dirs(self, account: Any = None) -> tuple[Path, Path]:
+        """(isolated HOME, gemini dir) for a pool account; legacy home when None."""
+        if account is None:
+            return self._isolated_home, self._isolated_gemini_dir
+        cached = self._pool_homes.get(account.name)
+        if cached is not None and cached[0] == account.token_path:
+            return cached[1]
+        # (Re)linked only when the account's token file changes (e.g. re-login
+        # wrote the other basename), never under a live worker otherwise.
+        dirs = setup_isolated_home(
+            Path(self._cwd) / ".agy-pool" / account.name, real_token=account.token_path
+        )
+        self._pool_homes[account.name] = (account.token_path, dirs)
+        return dirs
+
+    def _child_env(self, account: Any = None) -> dict[str, str]:
+        return build_child_env(self._account_dirs(account)[0])
+
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen) -> None:
+        terminate_process(proc)
+
+    def __enter__(self) -> "AntigravityClient":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        with self._lock:
+            self.is_closed = True
+            self._terminate_worker_locked()
+            procs = tuple(self._active_processes)
+            self._active_processes.clear()
+        for proc in procs:
+            self._terminate_process(proc)
+        if self._temp_dir is not None:
+            with contextlib.suppress(Exception):
+                self._temp_dir.cleanup()
+            self._temp_dir = None
+
+    def _terminate_worker_locked(self) -> None:
+        if self._worker_proc is not None:
+            proc = self._worker_proc
+            self._worker_proc = None
+            self._worker_model = None
+            self._worker_effort = None
+            self._worker_history = []
+            self._worker_account = None
+            self._active_processes.discard(proc)
+            self._terminate_process(proc)
+        # The session is gone: any later usage from it belongs to a dead
+        # session, and the next spawn must start from a clean baseline.
+        self._worker_usage_baseline = {}
+
+    def _terminate_worker(self) -> None:
+        with self._lock:
+            self._terminate_worker_locked()
+
+    def _update_worker_history(self, messages: list[dict[str, Any]] | None) -> None:
+        with self._lock:
+            self._worker_history = list(messages or [])
+
+    def _get_or_spawn_worker(
+        self, model: str, effort: str | None, account: Any = None
+    ) -> subprocess.Popen:
+        account_name = account.name if account is not None else None
+        with self._lock:
+            if (
+                self._worker_proc is not None
+                and self._worker_proc.poll() is None
+                and self._worker_model == model
+                and self._worker_effort == effort
+                and self._worker_account == account_name
+            ):
+                return self._worker_proc
+
+            self._terminate_worker_locked()
+
+            cmd_args = [self._command, "--input-format", "stream-json", *self._args]
+            if model:
+                cmd_args.extend(["--model", model])
+            if effort:
+                cmd_args.extend(["--effort", effort])
+
+            proc = subprocess.Popen(
+                cmd_args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                cwd=self._cwd,
+                env=self._child_env(account) if account is not None else self._child_env(),
+                **_own_process_group(),
+            )
+            proc._agy_stderr_tail = _StderrTail(proc)
+            self._worker_proc = proc
+            self._worker_account = account_name
+            self._worker_model = model
+            self._worker_effort = effort
+            self._worker_history = []
+            self._worker_usage_baseline = {}
+            self._active_processes.add(proc)
+            return proc
+
+    def _run_oneshot_completion(
+        self,
+        *,
+        model: str,
+        effort: str | None,
+        messages: list[dict[str, Any]],
+        timeout: float,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+        stream: bool,
+        account: Any = None,
+    ) -> Any:
+        prompt_text = _format_messages_as_prompt(
+            messages, model=model, tools=tools, tool_choice=tool_choice
+        )
+        cmd_args = [self._command, *self._args]
+        if model:
+            cmd_args.extend(["--model", model])
+        if effort:
+            cmd_args.extend(["--effort", effort])
+
+        proc = subprocess.Popen(
+            cmd_args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            cwd=self._cwd,
+            env=self._child_env(account) if account is not None else self._child_env(),
+            **_own_process_group(),
+        )
+
+        proc._agy_stderr_tail = _StderrTail(proc)
+        try:
+            if proc.stdin:
+                proc.stdin.write(prompt_text + "\n")
+                proc.stdin.flush()
+                proc.stdin.close()
+        except OSError:
+            pass
+
+        with self._lock:
+            self._active_processes.add(proc)
+
+        stream_iter = AntigravityStream(
+            proc=proc,
+            client=self,
+            model=model,
+            timeout=timeout,
+            tools=tools,
+            is_worker=False,
+            gemini_dir=self._account_dirs(account)[1] if account is not None else None,
+        )
+        if stream:
+            return stream_iter
+        return collect_stream_completion(stream_iter)
+
+    def _create_chat_completion(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        timeout: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        stream: bool = False,
+        reasoning_effort: str | None = None,
+        **extra_kwargs: Any,
+    ) -> Any:
+        if self.is_closed:
+            raise RuntimeError("AntigravityClient is closed.")
+
+        pool_accounts = agy_pool.discover_accounts()
+        if not pool_accounts and not is_authenticated():
+            raise RuntimeError(
+                "Antigravity CLI is not authenticated. Please run 'agy' in your terminal "
+                "to log in with your Google account."
+            )
+
+        effort_param = reasoning_effort or extra_kwargs.get("reasoning_effort")
+        resolved_model, effort = self._resolve_model_and_effort(model, effort_param)
+        messages_list = list(messages or [])
+        effective_timeout = (
+            float(timeout)
+            if isinstance(timeout, (int, float)) and timeout > 0
+            else _DEFAULT_TIMEOUT_SECONDS
+        )
+        request = dict(
+            resolved_model=resolved_model,
+            effort=effort,
+            messages_list=messages_list,
+            effective_timeout=effective_timeout,
+            tools=tools,
+            tool_choice=tool_choice,
+            stream=stream,
+        )
+        if not pool_accounts:
+            return self._complete_on_account(None, **request)
+        return self._complete_with_pool(agy_pool.acquire_order(pool_accounts), request)
+
+    def _complete_with_pool(self, order: list[Any], request: dict[str, Any]) -> Any:
+        """Try the request on each pool account in *order* (local multi-account patch).
+
+        A quota/429/auth failure puts the account in cooldown and retries the
+        SAME request on the next account; only when every account failed does
+        the error reach Hermes (which then falls back to its next provider).
+        Streams fail over lazily, as long as nothing was yielded yet.
+        """
+        remaining = list(order)
+        transient_retries = 0
+
+        def can_retry(account: Any, kind: str | None) -> bool:
+            nonlocal transient_retries
+            if kind == "transient":
+                if transient_retries:
+                    return False
+                transient_retries += 1
+                if not agy_pool.in_cooldown(account):
+                    remaining.insert(0, account)
+            return kind is not None and bool(remaining)
+
+        def start() -> tuple[Any, Any]:
+            while True:
+                account = remaining.pop(0)
+                try:
+                    return account, self._complete_on_account(account, **request)
+                except Exception as exc:
+                    kind = agy_pool.classify_error(exc)
+                    agy_pool.mark_failure(account, kind, exc)
+                    if not can_retry(account, kind):
+                        raise
+
+        account, result = start()
+        if not request["stream"]:
+            agy_pool.mark_success(account, request["resolved_model"])
+            return result
+
+        def retry(exc: BaseException) -> tuple[Any, Any] | None:
+            kind = agy_pool.classify_error(exc)
+            agy_pool.mark_failure(pooled.account, kind, exc)
+            if not can_retry(pooled.account, kind):
+                return None
+            return start()
+
+        pooled = _PooledStream(account, result, retry, request["resolved_model"])
+        return pooled
+
+    def _complete_on_account(
+        self,
+        account: Any,
+        *,
+        resolved_model: str,
+        effort: str | None,
+        messages_list: list[dict[str, Any]],
+        effective_timeout: float,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+        stream: bool,
+    ) -> Any:
+        """One attempt on one account (None = legacy single token). Upstream logic, unchanged."""
+        worker_acquired = self._worker_lock.acquire(blocking=False)
+        if worker_acquired:
+            try:
+                proc = self._get_or_spawn_worker(resolved_model, effort, account)
+                with self._lock:
+                    is_continuation = _messages_match_prefix(self._worker_history, messages_list)
+
+                if is_continuation:
+                    delta_msgs = messages_list[len(self._worker_history):]
+                    prompt_payload = _format_delta_prompt(delta_msgs)
+                else:
+                    if self._worker_history:
+                        self._terminate_worker()
+                        proc = self._get_or_spawn_worker(resolved_model, effort, account)
+                    prompt_payload = _format_messages_as_prompt(
+                        messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice
+                    )
+
+                event_msg = {"event": "user", "message": {"content": prompt_payload}}
+                try:
+                    proc.stdin.write(json.dumps(event_msg) + "\n")
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    self._terminate_worker()
+                    proc = self._get_or_spawn_worker(resolved_model, effort, account)
+                    prompt_payload = _format_messages_as_prompt(
+                        messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice
+                    )
+                    event_msg = {"event": "user", "message": {"content": prompt_payload}}
+                    proc.stdin.write(json.dumps(event_msg) + "\n")
+                    proc.stdin.flush()
+
+                with self._lock:
+                    worker_usage_baseline = self._worker_usage_baseline
+                stream_iter = AntigravityStream(
+                    proc=proc,
+                    client=self,
+                    model=resolved_model,
+                    timeout=effective_timeout,
+                    tools=tools,
+                    is_worker=True,
+                    worker_lock=self._worker_lock,
+                    messages=messages_list,
+                    usage_baseline=worker_usage_baseline,
+                    gemini_dir=self._account_dirs(account)[1] if account is not None else None,
+                )
+                if stream:
+                    return stream_iter
+                try:
+                    return collect_stream_completion(stream_iter)
+                finally:
+                    if self._worker_lock.locked():
+                        self._worker_lock.release()
+            except Exception:
+                self._terminate_worker()
+                if self._worker_lock.locked():
+                    self._worker_lock.release()
+                raise
+        else:
+            return self._run_oneshot_completion(
+                model=resolved_model,
+                effort=effort,
+                messages=messages_list,
+                timeout=effective_timeout,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+                account=account,
+            )
+
+
+class _PooledStream(AntigravityStream):
+    """Stream facade that fails over to the next pool account (local multi-account patch).
+
+    If the current account's stream raises a retryable error BEFORE any chunk
+    reached the consumer, ``retry(exc)`` returns ``(account, new_stream)`` and
+    iteration continues transparently; otherwise the error propagates. The
+    async/await surface is inherited from AntigravityStream, which drives
+    everything through ``__next__``/``close``.
+    """
+
+    def __init__(self, account: Any, inner: Any, retry: Any, model: str | None):
+        self.account = account
+        self._inner = inner
+        self._retry = retry
+        self._model_name = model
+        self._yielded = False
+        self._closed = False
+        self._async_executor = None
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "_inner":
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+    def _finish(self) -> None:
+        self._closed = True
+        self._retire_executor()
+
+    def __next__(self) -> Any:
+        if self._closed:
+            raise StopIteration
+        while True:
+            try:
+                chunk = next(self._inner)
+            except StopIteration:
+                self._finish()
+                raise
+            except Exception as exc:
+                try:
+                    replacement = None if self._yielded else self._retry(exc)
+                except Exception:
+                    self._finish()
+                    raise
+                if replacement is None:
+                    self._finish()
+                    raise
+                self.account, self._inner = replacement
+                continue
+            if not self._yielded:
+                # First chunk = this account is serving the request. Recorded
+                # here, not at exhaustion: consumers may stop at finish_reason.
+                self._yielded = True
+                agy_pool.mark_success(self.account, self._model_name)
+            return chunk
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._finish()
+        self._inner.close()
