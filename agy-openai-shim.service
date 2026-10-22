@@ -1,5 +1,5 @@
 [Unit]
-Description=agy-openai-shim: OpenAI-compatible loopback endpoint over Google agy CLI (3-account account pool) for OpenClaw
+Description=agy-openai-shim: OpenAI-compatible loopback over Google agy CLI (multi-account pool)
 Documentation=file:%h/.local/share/agy-openai-shim/README.md
 After=network-online.target
 

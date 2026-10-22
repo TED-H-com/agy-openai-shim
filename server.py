@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """agy-openai-shim: OpenAI-compatible /v1/chat/completions on loopback, backed by
-Google's official `agy` CLI with a fill_first multi-account pool.
+Google's official `agy` CLI with a multi-account pool.
 
-Vendored from the box's Hermes plugin `antigravity-subscription-directsdk`
-(soyelmismo/hermes-antigravity-subscription, MIT) + local multi-account patch.
-Managed by Grok Bot (grok-bot-01). Stdlib only.
+Vendored from the Hermes plugin `antigravity-subscription-directsdk`
+(soyelmismo/hermes-antigravity-subscription, MIT) + multi-account pool patch.
+Stdlib only.
 
 Env:
   AGY_SHIM_HOST / AGY_SHIM_PORT   (default 127.0.0.1:18795)
-  ANTIGRAVITY_ACCOUNT_DIRS        colon list of agy config dirs, in failover order
-  ANTIGRAVITY_POOL_STRATEGY       fill_first
+  ANTIGRAVITY_ACCOUNT_DIRS        colon list of agy config dirs, in pool order
+  ANTIGRAVITY_POOL_STRATEGY       round_robin or fill_first
   ANTIGRAVITY_POOL_STATE_DIR      pool state/events log dir
   AGY_SHIM_TIMEOUT                per-request seconds (default 900)
 """

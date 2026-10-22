@@ -416,7 +416,7 @@ class AntigravityStream(Iterator[Any]):
         has_tool_calls = False
         has_content = False
         in_tool_call = False
-        # grok-bot fix 2026-09-27: running tool-call index across <tool_call>
+        # fix 2026-09-27: running tool-call index across <tool_call>
         # blocks (each block used to restart at index 0, so OpenAI-style
         # clients merged parallel calls into one call with concatenated,
         # invalid JSON arguments), plus a stop flag once the model starts
