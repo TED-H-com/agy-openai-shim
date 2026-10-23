@@ -112,10 +112,22 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
             return self._json(404, {"error": {"message": "not found"}})
         try:
-            length = int(self.headers.get("Content-Length") or 0)
+            length_str = self.headers.get("Content-Length")
+            length = int(length_str) if length_str else 0
+            if length > 10 * 1024 * 1024:  # 10 MB limit
+                return self._json(413, {"error": {"message": "payload too large"}})
             req = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(req, dict):
+                raise ValueError("JSON payload must be a dictionary")
+            if req.get("messages") is not None and not isinstance(req.get("messages"), list):
+                raise ValueError("messages must be a list")
+            if req.get("model") is not None and not isinstance(req.get("model"), str):
+                raise ValueError("model must be a string")
+            if req.get("reasoning") is not None and not isinstance(req.get("reasoning"), dict):
+                raise ValueError("reasoning must be a dictionary")
         except Exception as exc:  # noqa: BLE001
-            return self._json(400, {"error": {"message": f"bad request: {exc}"}})
+            log.warning("bad request: %s", str(exc)[:300])
+            return self._json(400, {"error": {"message": "bad request or invalid JSON"}})
 
         messages = []
         for m in req.get("messages") or []:
@@ -136,7 +148,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             status, code = error_status(exc)
             log.warning("completion failed (%s): %s", status, str(exc)[:300])
-            return self._json(status, {"error": {"message": str(exc)[:2000], "type": code, "code": code}})
+            return self._json(status, {"error": {"message": "upstream error", "type": code, "code": code}})
 
         if not stream:
             out = clean(to_plain(result))
@@ -150,7 +162,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             status, code = error_status(exc)
             log.warning("stream failed before first chunk (%s): %s", status, str(exc)[:300])
-            return self._json(status, {"error": {"message": str(exc)[:2000], "type": code, "code": code}})
+            return self._json(status, {"error": {"message": "upstream error", "type": code, "code": code}})
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -184,7 +196,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             log.warning("stream failed mid-way: %s", str(exc)[:300])
             try:
-                err = {"error": {"message": str(exc)[:2000], "type": error_status(exc)[1]}}
+                err = {"error": {"message": "upstream error", "type": error_status(exc)[1]}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\n")
                 self.wfile.flush()
             except OSError:
