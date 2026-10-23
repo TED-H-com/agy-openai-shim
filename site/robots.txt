@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://ted-h-com.github.io/agy-openai-shim/sitemap.xml
