@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -82,6 +83,16 @@ def error_status(exc: BaseException) -> tuple[int, str]:
     return 502, "upstream_error"
 
 
+def sanitize_error(exc: BaseException) -> str:
+    """Returns a redacted, length-limited string from an exception."""
+    raw = str(exc)[:300]
+    # Redact potential API keys / tokens (alphanumeric strings of decent length)
+    raw = re.sub(r'([A-Za-z0-9-_]{30,})', '***REDACTED***', raw)
+    # Redact absolute paths
+    raw = re.sub(r'(/[a-zA-Z0-9_.-]+)+', '***PATH***', raw)
+    return f"upstream error: {raw}"
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "agy-openai-shim/1"
@@ -112,10 +123,33 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
             return self._json(404, {"error": {"message": "not found"}})
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-            req = json.loads(self.rfile.read(length) or b"{}")
+            length_str = self.headers.get("Content-Length")
+            length = 0
+            if length_str is not None:
+                length = int(length_str)
+                if length < 0:
+                    return self._json(400, {"error": {"message": "bad request: negative Content-Length"}})
+            if length > 10 * 1024 * 1024:  # 10 MB limit
+                return self._json(413, {"error": {"message": "payload too large"}})
+
+            try:
+                req = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                return self._json(400, {"error": {"message": "bad request: invalid JSON"}})
+
+            if not isinstance(req, dict):
+                return self._json(400, {"error": {"message": "bad request: JSON payload must be a dictionary"}})
+            if req.get("messages") is not None and not isinstance(req.get("messages"), list):
+                return self._json(400, {"error": {"message": "bad request: messages must be a list"}})
+            if req.get("model") is not None and not isinstance(req.get("model"), str):
+                return self._json(400, {"error": {"message": "bad request: model must be a string"}})
+            if req.get("reasoning") is not None and not isinstance(req.get("reasoning"), dict):
+                return self._json(400, {"error": {"message": "bad request: reasoning must be a dictionary"}})
+        except ValueError:
+            return self._json(400, {"error": {"message": "bad request: invalid Content-Length"}})
         except Exception as exc:  # noqa: BLE001
-            return self._json(400, {"error": {"message": f"bad request: {exc}"}})
+            log.warning("bad request: %s", str(exc)[:300])
+            return self._json(400, {"error": {"message": "bad request: invalid input"}})
 
         messages = []
         for m in req.get("messages") or []:
@@ -136,7 +170,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             status, code = error_status(exc)
             log.warning("completion failed (%s): %s", status, str(exc)[:300])
-            return self._json(status, {"error": {"message": str(exc)[:2000], "type": code, "code": code}})
+            return self._json(status, {"error": {"message": sanitize_error(exc), "type": code, "code": code}})
 
         if not stream:
             out = clean(to_plain(result))
@@ -150,7 +184,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             status, code = error_status(exc)
             log.warning("stream failed before first chunk (%s): %s", status, str(exc)[:300])
-            return self._json(status, {"error": {"message": str(exc)[:2000], "type": code, "code": code}})
+            return self._json(status, {"error": {"message": sanitize_error(exc), "type": code, "code": code}})
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -184,7 +218,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             log.warning("stream failed mid-way: %s", str(exc)[:300])
             try:
-                err = {"error": {"message": str(exc)[:2000], "type": error_status(exc)[1]}}
+                err = {"error": {"message": sanitize_error(exc), "type": error_status(exc)[1]}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\n")
                 self.wfile.flush()
             except OSError:
