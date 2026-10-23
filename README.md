@@ -1,5 +1,7 @@
 # agy-openai-shim
 
+[Project website](https://ted-h-com.github.io/agy-openai-shim/?lang=en) · [繁體中文介紹](https://ted-h-com.github.io/agy-openai-shim/?lang=zh-TW)
+
 OpenAI-compatible `/v1/chat/completions` loopback server backed by Google's official `agy` (Antigravity) CLI. Lets tools that speak the OpenAI wire protocol use an Antigravity / Gemini subscription instead of a metered API key.
 
 This is a **Python, stdlib-only** implementation with a **multi-account pool** (round-robin or fill-first failover, per-account quota cooldown). It is **not** the same codebase as [tphakala/agy-openai-shim](https://github.com/tphakala/agy-openai-shim) (Go).
