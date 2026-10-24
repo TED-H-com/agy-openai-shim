@@ -86,10 +86,12 @@ def error_status(exc: BaseException) -> tuple[int, str]:
 def sanitize_error(exc: BaseException) -> str:
     """Returns a redacted, length-limited string from an exception."""
     raw = str(exc)[:300]
-    # Redact potential API keys / tokens (alphanumeric strings of decent length)
-    raw = re.sub(r'([A-Za-z0-9-_]{30,})', '***REDACTED***', raw)
-    # Redact absolute paths
-    raw = re.sub(r'(/[a-zA-Z0-9_.-]+)+', '***PATH***', raw)
+    # Redact token-like strings (e.g., sk-, ya29., AIza, or long hex/base64 strings)
+    raw = re.sub(r'(?:sk-|ya29\.|AIza)[A-Za-z0-9-_]{20,}', '***REDACTED***', raw)
+    # Target 40+ char hex or base64ish looking tokens that aren't typical words
+    raw = re.sub(r'\b[A-Za-z0-9-_]{40,}\b', '***REDACTED***', raw)
+    # Redact real absolute filesystem paths only (starting with /home, /root, /tmp, /etc, /var, /Users)
+    raw = re.sub(r'(/(?:home|root|tmp|etc|var|Users)/[a-zA-Z0-9_.-/]+)', '***PATH***', raw)
     return f"upstream error: {raw}"
 
 
