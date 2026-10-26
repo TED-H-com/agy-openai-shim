@@ -144,13 +144,11 @@ class Handler(BaseHTTPRequestHandler):
             log.warning("stream failed before first chunk (%s): %s", status, str(exc)[:300])
             return self._json(status, {"error": {"message": str(exc)[:2000], "type": code, "code": code}})
 
-        self.wfile.write(
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: text/event-stream\r\n"
-            b"Cache-Control: no-cache\r\n"
-            b"Connection: close\r\n\r\n"
-        )
-        self.wfile.flush()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
         self.close_connection = True
 
         def emit(chunk):
