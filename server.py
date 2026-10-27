@@ -15,6 +15,7 @@ Env:
 """
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -38,6 +39,8 @@ log = logging.getLogger("agy-shim")
 MODELS = ["gemini-3.8-flash", "gemini-3.8-flash-low", "gemini-3.8-flash-medium",
           "gemini-3.8-flash-high", "gemini-3.1-pro"]
 TIMEOUT = float(os.getenv("AGY_SHIM_TIMEOUT", "900"))
+AUTH_TOKEN = os.getenv("AGY_SHIM_AUTH_TOKEN")
+MAX_BODY_SIZE = int(os.getenv("AGY_SHIM_MAX_BODY_SIZE", "10485760"))
 _client_lock = threading.Lock()
 _client: AntigravityClient | None = None
 WORKDIR = Path(os.getenv("AGY_SHIM_WORKDIR", str(Path.home() / ".local/state/agy-openai-shim/work")))
@@ -97,7 +100,39 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def check_security(self) -> bool:
+        # Host header validation
+        host_header = self.headers.get("Host", "")
+        # Remove port if present
+        host = host_header
+        if host.startswith("["):
+            # IPv6 literal
+            end_bracket = host.find("]")
+            if end_bracket != -1:
+                host = host[1:end_bracket]
+        else:
+            host = host.split(":")[0]
+        allowed_hosts = {"localhost", "127.0.0.1", "::1", os.getenv("AGY_SHIM_HOST", "127.0.0.1")}
+        if host not in allowed_hosts:
+            self._json(400, {"error": {"message": "Invalid Host header"}})
+            return False
+
+        # Auth token validation
+        if AUTH_TOKEN:
+            auth_header = self.headers.get("Authorization", "")
+            if not auth_header.lower().startswith("bearer "):
+                self._json(401, {"error": {"message": "invalid_api_key"}})
+                return False
+            token = auth_header[7:].strip()
+            if not hmac.compare_digest(token, AUTH_TOKEN):
+                self._json(401, {"error": {"message": "invalid_api_key"}})
+                return False
+
+        return True
+
     def do_GET(self):
+        if not self.check_security():
+            return
         if self.path.rstrip("/") in ("/v1/models", "/models"):
             now = int(time.time())
             self._json(200, {"object": "list", "data": [
@@ -109,10 +144,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": {"message": "not found"}})
 
     def do_POST(self):
+        if not self.check_security():
+            return
         if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
             return self._json(404, {"error": {"message": "not found"}})
         try:
             length = int(self.headers.get("Content-Length") or 0)
+            if length > MAX_BODY_SIZE:
+                return self._json(413, {"error": {"message": "Payload Too Large"}})
             req = json.loads(self.rfile.read(length) or b"{}")
         except Exception as exc:  # noqa: BLE001
             return self._json(400, {"error": {"message": f"bad request: {exc}"}})
