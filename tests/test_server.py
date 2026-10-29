@@ -271,3 +271,114 @@ def test_reasoning_effort_translation(test_server, mock_client):
         assert response.status == 200
         call_kwargs = mock_client.return_value.chat.completions.create.call_args.kwargs
         assert call_kwargs["reasoning_effort"] == "low"
+
+
+
+def test_host_header_validation(test_server, mock_client):
+    req_data = {
+        "model": "gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "Hi"}]
+    }
+
+    # Invalid host
+    req = urllib.request.Request(
+        f"{test_server}/v1/chat/completions",
+        data=json.dumps(req_data).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Host": "example.com"},
+        method="POST"
+    )
+
+    try:
+        urllib.request.urlopen(req)
+        assert False, "Should have failed with 400"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        data = json.loads(e.read())
+        assert data["error"]["message"] == "Invalid Host header"
+
+    # Valid host with IPv6 bracket
+    req = urllib.request.Request(
+        f"{test_server}/v1/chat/completions",
+        data=json.dumps(req_data).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Host": "[::1]:18795"},
+        method="POST"
+    )
+
+    # We mock client to not actually call API
+    mock_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="Hello!"))]
+    )
+    mock_client.return_value.chat.completions.create.return_value = mock_response
+
+    try:
+        with urllib.request.urlopen(req) as response:
+            assert response.status == 200
+    except urllib.error.HTTPError as e:
+        assert e.code != 400
+
+def test_auth_token_validation(test_server, mock_client):
+    req_data = {
+        "model": "gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "Hi"}]
+    }
+
+    with patch("server.AUTH_TOKEN", "secret-token"):
+        # No token
+        req = urllib.request.Request(
+            f"{test_server}/v1/chat/completions",
+            data=json.dumps(req_data).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        try:
+            urllib.request.urlopen(req)
+            assert False, "Should have failed with 401"
+        except urllib.error.HTTPError as e:
+            assert e.code == 401
+            assert json.loads(e.read())["error"]["message"] == "invalid_api_key"
+
+        # Invalid token
+        req = urllib.request.Request(
+            f"{test_server}/v1/chat/completions",
+            data=json.dumps(req_data).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer bad-token"},
+            method="POST"
+        )
+        try:
+            urllib.request.urlopen(req)
+            assert False, "Should have failed with 401"
+        except urllib.error.HTTPError as e:
+            assert e.code == 401
+
+        # Valid token
+        req = urllib.request.Request(
+            f"{test_server}/v1/chat/completions",
+            data=json.dumps(req_data).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer secret-token"},
+            method="POST"
+        )
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="Hello!"))]
+        )
+        mock_client.return_value.chat.completions.create.return_value = mock_response
+
+        with urllib.request.urlopen(req) as response:
+            assert response.status == 200
+
+
+def test_body_size_limit(test_server):
+    # Use a small limit so we don't trigger BrokenPipeError
+    req = urllib.request.Request(
+        f"{test_server}/v1/chat/completions",
+        data=b"x" * 200,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    with patch("server.MAX_BODY_SIZE", 100):
+        try:
+            urllib.request.urlopen(req)
+            assert False, "Should have failed with 413"
+        except urllib.error.HTTPError as e:
+            assert e.code == 413
+            assert json.loads(e.read())["error"]["message"] == "Payload Too Large"
