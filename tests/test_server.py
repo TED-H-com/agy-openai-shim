@@ -271,3 +271,70 @@ def test_reasoning_effort_translation(test_server, mock_client):
         assert response.status == 200
         call_kwargs = mock_client.return_value.chat.completions.create.call_args.kwargs
         assert call_kwargs["reasoning_effort"] == "low"
+
+def test_drop_none_keys_non_stream(test_server, mock_client):
+    mock_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    role="assistant",
+                    content="Hello!",
+                    tool_calls=None
+                )
+            )
+        ],
+        usage=None
+    )
+    mock_client.return_value.chat.completions.create.return_value = mock_response
+
+    req_data = {
+        "model": "gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": False
+    }
+
+    req = urllib.request.Request(
+        f"{test_server}/v1/chat/completions",
+        data=json.dumps(req_data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    with urllib.request.urlopen(req) as response:
+        assert response.status == 200
+        data = json.loads(response.read())
+        assert "tool_calls" not in data["choices"][0]["message"]
+        assert "usage" not in data
+
+def test_drop_none_keys_stream(test_server, mock_client):
+    chunk1 = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content="Hel", tool_calls=None),
+                finish_reason=None
+            )
+        ]
+    )
+    mock_client.return_value.chat.completions.create.return_value = iter([chunk1])
+
+    req_data = {
+        "model": "gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True
+    }
+
+    req = urllib.request.Request(
+        f"{test_server}/v1/chat/completions",
+        data=json.dumps(req_data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    with urllib.request.urlopen(req) as response:
+        assert response.status == 200
+        lines = [line.decode("utf-8") for line in response.readlines() if line.strip()]
+
+        assert len(lines) == 2
+        data1 = json.loads(lines[0].replace("data: ", ""))
+        assert "tool_calls" not in data1["choices"][0]["delta"]
+        assert "finish_reason" not in data1["choices"][0]
