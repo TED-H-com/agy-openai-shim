@@ -6,6 +6,13 @@ OpenAI-compatible `/v1/chat/completions` loopback server backed by Google's offi
 
 This is a **Python, stdlib-only** implementation with a **multi-account pool** (round-robin or fill-first failover, per-account quota cooldown). It is **not** the same codebase as [tphakala/agy-openai-shim](https://github.com/tphakala/agy-openai-shim) (Go).
 
+## Documentation
+
+- [API Compatibility Matrix](docs/API_COMPATIBILITY.md)
+- [Account Pool Strategy](docs/ACCOUNT_POOL.md)
+- [Rate Limits and Error Handling](docs/RATE_LIMITS.md)
+- [Detailed Setup Guide](docs/SETUP_GUIDE.md)
+
 ## How it works
 
 ```
