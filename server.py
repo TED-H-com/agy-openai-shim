@@ -41,6 +41,8 @@ MODELS = ["gemini-3.8-flash", "gemini-3.8-flash-low", "gemini-3.8-flash-medium",
 TIMEOUT = float(os.getenv("AGY_SHIM_TIMEOUT", "900"))
 AUTH_TOKEN = os.getenv("AGY_SHIM_AUTH_TOKEN")
 MAX_BODY_SIZE = int(os.getenv("AGY_SHIM_MAX_BODY_SIZE", "10485760"))
+_allowed_hosts_env = os.getenv("AGY_SHIM_ALLOWED_HOSTS")
+ALLOWED_HOSTS = set(_allowed_hosts_env.split(",")) if _allowed_hosts_env else None
 _client_lock = threading.Lock()
 _client: AntigravityClient | None = None
 WORKDIR = Path(os.getenv("AGY_SHIM_WORKDIR", str(Path.home() / ".local/state/agy-openai-shim/work")))
@@ -102,20 +104,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def check_security(self) -> bool:
         # Host header validation
-        host_header = self.headers.get("Host", "")
-        # Remove port if present
-        host = host_header
-        if host.startswith("["):
-            # IPv6 literal
-            end_bracket = host.find("]")
-            if end_bracket != -1:
-                host = host[1:end_bracket]
-        else:
-            host = host.split(":")[0]
-        allowed_hosts = {"localhost", "127.0.0.1", "::1", os.getenv("AGY_SHIM_HOST", "127.0.0.1")}
-        if host not in allowed_hosts:
-            self._json(400, {"error": {"message": "Invalid Host header"}})
-            return False
+        if ALLOWED_HOSTS is not None:
+            host_header = self.headers.get("Host", "")
+            # Remove port if present
+            host = host_header
+            if host.startswith("["):
+                # IPv6 literal
+                end_bracket = host.find("]")
+                if end_bracket != -1:
+                    host = host[1:end_bracket]
+            else:
+                host = host.split(":")[0]
+            if host not in ALLOWED_HOSTS:
+                self._json(400, {"error": {"message": "Invalid Host header"}})
+                return False
 
         # Auth token validation
         if AUTH_TOKEN:

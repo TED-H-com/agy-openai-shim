@@ -274,47 +274,74 @@ def test_reasoning_effort_translation(test_server, mock_client):
 
 
 
-def test_host_header_validation(test_server, mock_client):
+def test_host_header_validation_enabled(test_server, mock_client):
     req_data = {
         "model": "gemini-3.8-flash",
         "messages": [{"role": "user", "content": "Hi"}]
     }
 
-    # Invalid host
-    req = urllib.request.Request(
-        f"{test_server}/v1/chat/completions",
-        data=json.dumps(req_data).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Host": "example.com"},
-        method="POST"
-    )
+    with patch("server.ALLOWED_HOSTS", {"localhost", "127.0.0.1", "::1"}):
+        # Invalid host
+        req = urllib.request.Request(
+            f"{test_server}/v1/chat/completions",
+            data=json.dumps(req_data).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Host": "example.com"},
+            method="POST"
+        )
 
-    try:
-        urllib.request.urlopen(req)
-        assert False, "Should have failed with 400"
-    except urllib.error.HTTPError as e:
-        assert e.code == 400
-        data = json.loads(e.read())
-        assert data["error"]["message"] == "Invalid Host header"
+        try:
+            urllib.request.urlopen(req)
+            assert False, "Should have failed with 400"
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+            data = json.loads(e.read())
+            assert data["error"]["message"] == "Invalid Host header"
 
-    # Valid host with IPv6 bracket
-    req = urllib.request.Request(
-        f"{test_server}/v1/chat/completions",
-        data=json.dumps(req_data).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Host": "[::1]:18795"},
-        method="POST"
-    )
+        # Valid host with IPv6 bracket
+        req = urllib.request.Request(
+            f"{test_server}/v1/chat/completions",
+            data=json.dumps(req_data).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Host": "[::1]:18795"},
+            method="POST"
+        )
 
-    # We mock client to not actually call API
-    mock_response = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="Hello!"))]
-    )
-    mock_client.return_value.chat.completions.create.return_value = mock_response
+        # We mock client to not actually call API
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="Hello!"))]
+        )
+        mock_client.return_value.chat.completions.create.return_value = mock_response
 
-    try:
-        with urllib.request.urlopen(req) as response:
-            assert response.status == 200
-    except urllib.error.HTTPError as e:
-        assert e.code != 400
+        try:
+            with urllib.request.urlopen(req) as response:
+                assert response.status == 200
+        except urllib.error.HTTPError as e:
+            assert e.code != 400
+
+def test_host_header_validation_disabled(test_server, mock_client):
+    req_data = {
+        "model": "gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "Hi"}]
+    }
+
+    with patch("server.ALLOWED_HOSTS", None):
+        # Even 'invalid' host should work if disabled
+        req = urllib.request.Request(
+            f"{test_server}/v1/chat/completions",
+            data=json.dumps(req_data).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Host": "example.com"},
+            method="POST"
+        )
+
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="Hello!"))]
+        )
+        mock_client.return_value.chat.completions.create.return_value = mock_response
+
+        try:
+            with urllib.request.urlopen(req) as response:
+                assert response.status == 200
+        except urllib.error.HTTPError as e:
+            assert e.code != 400
 
 def test_auth_token_validation(test_server, mock_client):
     req_data = {
