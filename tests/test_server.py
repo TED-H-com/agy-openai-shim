@@ -39,6 +39,63 @@ def test_health(test_server):
             assert data["ok"] is True
             assert data["accounts"] == ["test_acct"]
 
+def test_health_no_accounts(test_server):
+    req = urllib.request.Request(f"{test_server}/health")
+    with patch("server.agy_pool.discover_accounts", return_value=[]):
+        try:
+            urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            assert e.code == 503
+            data = json.loads(e.read())
+            assert data["ok"] is False
+            assert data["accounts"] == []
+
+def test_get_models(test_server):
+    req = urllib.request.Request(f"{test_server}/v1/models")
+    with urllib.request.urlopen(req) as response:
+        assert response.status == 200
+        data = json.loads(response.read())
+        assert data["object"] == "list"
+        assert len(data["data"]) > 0
+        assert data["data"][0]["id"] == "gemini-3.8-flash"
+
+def test_get_404(test_server):
+    req = urllib.request.Request(f"{test_server}/unknown")
+    try:
+        urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+        data = json.loads(e.read())
+        assert data["error"]["message"] == "not found"
+
+def test_post_404(test_server):
+    req = urllib.request.Request(
+        f"{test_server}/unknown",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+        data = json.loads(e.read())
+        assert data["error"]["message"] == "not found"
+
+def test_post_invalid_json(test_server):
+    req = urllib.request.Request(
+        f"{test_server}/v1/chat/completions",
+        data=b"{invalid json",
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        data = json.loads(e.read())
+        assert "bad request" in data["error"]["message"]
+
 def test_chat_completion(test_server, mock_client):
     mock_response = SimpleNamespace(
         choices=[
@@ -220,6 +277,220 @@ def test_developer_role_translation(test_server, mock_client):
         assert messages[0]["role"] == "system"
         assert messages[0]["content"] == "You are a helpful assistant."
         assert messages[1]["role"] == "user"
+
+def test_client_initialization():
+    with patch("server.AntigravityClient") as mock_antigravity, \
+         patch("pathlib.Path.mkdir") as mock_mkdir, \
+         patch("server._client", None):
+        mock_instance = mock_antigravity.return_value
+        mock_instance.is_closed = False
+
+        client = server.client()
+        mock_mkdir.assert_called_once_with(parents=True, exist_ok=True)
+        mock_antigravity.assert_called_once_with(cwd=str(server.WORKDIR))
+        assert client == mock_instance
+
+        # Test singleton behavior
+        client2 = server.client()
+        assert client2 == client
+        mock_antigravity.assert_called_once()  # not called again
+
+def test_chat_completion_exception_handling(test_server, mock_client):
+    mock_client.return_value.chat.completions.create.side_effect = Exception("Quota exceeded")
+
+    req_data = {
+        "model": "gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "Hi"}]
+    }
+
+    req = urllib.request.Request(
+        f"{test_server}/v1/chat/completions",
+        data=json.dumps(req_data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    with patch("server.agy_pool.classify_error", return_value="quota"):
+        try:
+            urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            assert e.code == 429
+            data = json.loads(e.read())
+            assert "error" in data
+            assert data["error"]["code"] == "rate_limit_exceeded"
+            assert data["error"]["type"] == "rate_limit_exceeded"
+
+    with patch("server.agy_pool.classify_error", return_value="auth"):
+        try:
+            urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            assert e.code == 401
+            data = json.loads(e.read())
+            assert data["error"]["type"] == "invalid_api_key"
+
+    with patch("server.agy_pool.classify_error", return_value="transient"):
+        try:
+            urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            assert e.code == 503
+            data = json.loads(e.read())
+            assert data["error"]["type"] == "upstream_transient"
+
+    with patch("server.agy_pool.classify_error", return_value="other"):
+        try:
+            urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            assert e.code == 502
+            data = json.loads(e.read())
+            assert data["error"]["type"] == "upstream_error"
+
+def test_chat_completion_stream_exception_before_first_chunk(test_server, mock_client):
+    def mock_iter():
+        raise Exception("Stream failed early")
+        yield None
+
+    mock_client.return_value.chat.completions.create.return_value = mock_iter()
+
+    req_data = {
+        "model": "gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True
+    }
+
+    req = urllib.request.Request(
+        f"{test_server}/v1/chat/completions",
+        data=json.dumps(req_data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    with patch("server.agy_pool.classify_error", return_value="other"):
+        try:
+            urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            assert e.code == 502
+            data = json.loads(e.read())
+            assert "error" in data
+            assert data["error"]["type"] == "upstream_error"
+
+def test_chat_completion_stream_exception_midway(test_server, mock_client):
+    def mock_iter():
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="Hel"))])
+        raise Exception("Stream failed mid-way")
+
+    mock_client.return_value.chat.completions.create.return_value = mock_iter()
+
+    req_data = {
+        "model": "gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True
+    }
+
+    req = urllib.request.Request(
+        f"{test_server}/v1/chat/completions",
+        data=json.dumps(req_data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    with urllib.request.urlopen(req) as response:
+        assert response.status == 200
+        lines = [line.decode("utf-8") for line in response.readlines() if line.strip()]
+
+        # First chunk
+        data1 = json.loads(lines[0].replace("data: ", ""))
+        assert data1["choices"][0]["delta"]["content"] == "Hel"
+
+        # Error chunk
+        err_data = json.loads(lines[1].replace("data: ", ""))
+        assert "error" in err_data
+        assert "Stream failed mid-way" in err_data["error"]["message"]
+
+def test_chat_completion_stream_disconnection(test_server, mock_client):
+    mock_close = MagicMock()
+
+    class MockIter:
+        def __iter__(self):
+            yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="Hel"))])
+            raise ConnectionResetError("Client disconnected")
+
+        def close(self):
+            mock_close()
+
+    mock_client.return_value.chat.completions.create.return_value = MockIter()
+
+    req_data = {
+        "model": "gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True
+    }
+
+    req = urllib.request.Request(
+        f"{test_server}/v1/chat/completions",
+        data=json.dumps(req_data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req) as response:
+            response.read()
+    except urllib.error.URLError:
+        # Client disconnect causes urllib to throw
+        pass
+
+    mock_close.assert_called_once()
+
+def test_chat_completion_stream_usage_no_choices(test_server, mock_client):
+    chunk1 = SimpleNamespace(
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    )
+
+    mock_client.return_value.chat.completions.create.return_value = iter([chunk1])
+
+    req_data = {
+        "model": "gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True
+    }
+
+    req = urllib.request.Request(
+        f"{test_server}/v1/chat/completions",
+        data=json.dumps(req_data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    with urllib.request.urlopen(req) as response:
+        assert response.status == 200
+        lines = [line.decode("utf-8") for line in response.readlines() if line.strip()]
+
+        # Output chunk with choices added
+        data1 = json.loads(lines[0].replace("data: ", ""))
+        assert data1["usage"]["total_tokens"] == 15
+        assert data1["choices"] == []
+
+def test_to_plain_utils():
+    # test to_plain logic
+    from server import to_plain
+    obj = SimpleNamespace(
+        a=1,
+        b=SimpleNamespace(c=2),
+        d=[SimpleNamespace(e=3), (4, SimpleNamespace(f=5))],
+        g={"h": SimpleNamespace(i=6)}
+    )
+    result = to_plain(obj)
+    assert result == {
+        "a": 1,
+        "b": {"c": 2},
+        "d": [{"e": 3}, [4, {"f": 5}]],
+        "g": {"h": {"i": 6}}
+    }
+
+    # test clean logic
+    from server import clean
+    d = {"a": 1, "b": None, "c": [{"d": 2, "e": None}, None, 3]}
+    assert clean(d) == {"a": 1, "c": [{"d": 2}, None, 3]}
 
 def test_reasoning_effort_translation(test_server, mock_client):
     mock_response = SimpleNamespace(
