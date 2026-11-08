@@ -53,22 +53,14 @@ def client() -> AntigravityClient:
 
 
 def to_plain(obj):
+    """Convert SimpleNamespace to dict recursively and drop None-valued keys (OpenAI clients dislike null tool_calls etc.)."""
     if isinstance(obj, SimpleNamespace):
-        return {k: to_plain(v) for k, v in vars(obj).items()}
+        return {k: to_plain(v) for k, v in vars(obj).items() if v is not None}
     if isinstance(obj, dict):
-        return {k: to_plain(v) for k, v in obj.items()}
+        return {k: to_plain(v) for k, v in obj.items() if v is not None}
     if isinstance(obj, (list, tuple)):
         return [to_plain(v) for v in obj]
     return obj
-
-
-def clean(d):
-    """Drop None-valued keys recursively (OpenAI clients dislike null tool_calls etc.)."""
-    if isinstance(d, dict):
-        return {k: clean(v) for k, v in d.items() if v is not None}
-    if isinstance(d, list):
-        return [clean(v) for v in d]
-    return d
 
 
 def error_status(exc: BaseException) -> tuple[int, str]:
@@ -90,7 +82,7 @@ class Handler(BaseHTTPRequestHandler):
         log.info("%s %s", self.address_string(), fmt % args)
 
     def _json(self, status: int, payload: dict):
-        body = json.dumps(payload).encode()
+        body = json.dumps(payload, separators=(',', ':')).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -139,7 +131,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(status, {"error": {"message": str(exc)[:2000], "type": code, "code": code}})
 
         if not stream:
-            out = clean(to_plain(result))
+            out = to_plain(result)
             out.update({"id": rid, "object": "chat.completion", "created": created, "model": model})
             log.info("served non-stream model=%s in %.1fs", model, time.monotonic() - t0)
             return self._json(200, out)
@@ -160,12 +152,12 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
         def emit(chunk):
-            d = clean(to_plain(chunk))
+            d = to_plain(chunk)
             d.update({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model})
             usage = d.get("usage")
             if usage and "choices" not in d:
                 d["choices"] = []
-            self.wfile.write(b"data: " + json.dumps(d).encode() + b"\n\n")
+            self.wfile.write(b"data: " + json.dumps(d, separators=(',', ':')).encode() + b"\n\n")
             self.wfile.flush()
 
         try:
@@ -185,7 +177,7 @@ class Handler(BaseHTTPRequestHandler):
             log.warning("stream failed mid-way: %s", str(exc)[:300])
             try:
                 err = {"error": {"message": str(exc)[:2000], "type": error_status(exc)[1]}}
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\n")
+                self.wfile.write(b"data: " + json.dumps(err, separators=(',', ':')).encode() + b"\n\n")
                 self.wfile.flush()
             except OSError:
                 pass

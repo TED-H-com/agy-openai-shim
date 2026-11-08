@@ -487,10 +487,9 @@ def test_to_plain_utils():
         "g": {"h": {"i": 6}}
     }
 
-    # test clean logic
-    from server import clean
+    # test clean logic is now part of to_plain
     d = {"a": 1, "b": None, "c": [{"d": 2, "e": None}, None, 3]}
-    assert clean(d) == {"a": 1, "c": [{"d": 2}, None, 3]}
+    assert to_plain(d) == {"a": 1, "c": [{"d": 2}, None, 3]}
 
 def test_reasoning_effort_translation(test_server, mock_client):
     mock_response = SimpleNamespace(
