@@ -18,6 +18,12 @@ The following model IDs are explicitly provided in `/v1/models`:
 - `gemini-3.8-flash-high`
 - `gemini-3.1-pro`
 
+In addition, the internal model router (`agy/models.py`) provides mapping for a number of common aliases:
+- **Default/Flash**: `default`, `flash`, `gemini-flash`, `gemini-3.8` map to `gemini-3.8-flash`
+- **Pro**: `pro`, `gemini-pro`, `gemini-3.1` map to `gemini-3.1-pro`
+- **Claude Sonnet**: `sonnet`, `claude-sonnet` map to `claude-sonnet-4-6`
+- **Claude Opus**: `opus`, `claude-opus`, `claude-opus-4-6-thinking` map to `claude-opus-5-5-medium`
+
 Other valid Antigravity model names might also work if provided by the client, though they are not enumerated in the models list.
 
 ## Feature Mapping

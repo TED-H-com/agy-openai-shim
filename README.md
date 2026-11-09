@@ -12,6 +12,7 @@ This is a **Python, stdlib-only** implementation with a **multi-account pool** (
 - [Account Pool Strategy](docs/ACCOUNT_POOL.md)
 - [Rate Limits and Error Handling](docs/RATE_LIMITS.md)
 - [Detailed Setup Guide](docs/SETUP_GUIDE.md)
+- [Core Modules Architecture](docs/CORE_MODULES.md)
 
 ## How it works
 
@@ -76,6 +77,21 @@ Example account layout:
 
 ```bash
 curl -s http://127.0.0.1:18795/health
+```
+
+## Usage Examples
+
+Test the `/v1/chat/completions` endpoint with `curl`:
+
+```bash
+curl http://127.0.0.1:18795/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ANY_STRING" \
+  -d '{
+    "model": "gemini-3.8-flash",
+    "messages": [{"role": "user", "content": "Say this is a test!"}],
+    "stream": false
+  }'
 ```
 
 ## Attribution
